@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from datetime import datetime
 from functools import lru_cache
@@ -78,86 +79,126 @@ def _rescore(argv: list[str]) -> int:
                    help="override metric label (default: same as --metric)")
     p.add_argument("--skip-existing", action="store_true",
                    help="skip files whose results.json already has this metric set")
+    p.add_argument("--reference-manifest", type=Path,
+                   help="JSON manifest recorded before inference; require fingerprint and exact sample IDs")
     args = p.parse_args(argv)
+    manifest = None
+    if args.reference_manifest:
+        from afriscience_mt.core.alignment import load_manifest
+        try:
+            manifest = load_manifest(args.reference_manifest)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"Invalid reference manifest: {exc}", file=sys.stderr)
+            return 1
     label = args.metric_name or args.metric
 
-    from afriscience_mt.evaluation.metrics import compute_bleu, compute_chrf, MetricsCalculator
-    calc = (MetricsCalculator(metrics=["ssa_comet"])
-            if args.metric == "ssa_comet" else None)
+    pred_paths = sorted(Path(args.src).rglob("predictions.json"))
+    if not pred_paths:
+        print(f"No predictions.json found under {args.src}", file=sys.stderr)
+        return 1
 
-    n_done = n_skip = 0
-    preds = sorted(Path(args.src).rglob("predictions.json"))
-    total = len(preds)
-    print(f"found {total} predictions.json under {args.src}")
-    for idx, pred_path in enumerate(preds, 1):
-        if args.skip_existing:
-            rp = pred_path.parent / "results.json"
-            if rp.exists():
-                try:
-                    existing = load_result(rp)
-                except Exception:
-                    existing = None
-                if existing is not None and _metric_present(existing, label):
-                    print(f"  [{idx}/{total}] skip {pred_path.parent}: {label} already set")
-                    n_skip += 1
-                    continue
+    # Preflight the entire batch before loading a metric model or writing results.
+    prepared = []
+    n_skip = 0
+    for pred_path in pred_paths:
         try:
-            pf = load_predictions(pred_path)
-        except Exception as e:
-            print(f"  [{idx}/{total}] skip {pred_path}: {e}")
-            n_skip += 1
-            continue
-
-        # Look up src/ref from the canonical test split when not stored in the
-        # sample (the default — predictions.json normally carries only `hyp`).
-        ext_src = _test_text_column(pf.source_lang)
-        ext_ref = _test_text_column(pf.target_lang)
-
-        srcs, refs, hyps = [], [], []
-        for i, s in enumerate(pf.samples):
-            hyp = s.get("hyp")
-            if not hyp:
-                continue
-            ref = s.get("ref") or (ext_ref[i] if i < len(ext_ref) else None)
-            src = s.get("src") or (ext_src[i] if i < len(ext_src) else "")
-            if not ref:
-                continue
-            srcs.append(src)
-            refs.append(ref)
-            hyps.append(hyp)
-        if not hyps:
-            print(f"  [{idx}/{total}] skip {pred_path}: no usable samples (no ref in predictions and no test split for {pf.source_lang}/{pf.target_lang})")
-            n_skip += 1
-            continue
-
-        if args.metric == "bleu":
-            value = compute_bleu(hyps, refs)["bleu"]
-        elif args.metric == "chrf":
-            value = compute_chrf(hyps, refs)["chrf"]
-        else:
-            value = calc.compute(hypotheses=hyps, references=refs,
-                                 sources=srcs).get("ssa_comet")
-
-        # Update sibling results.json
-        result_path = pred_path.parent / "results.json"
-        if not result_path.exists():
-            print(f"  warn no results.json at {result_path.parent}")
-        else:
-            r = load_result(result_path)
-            if label in {"bleu", "chrf", "ssa_comet"}:
-                setattr(r.metrics, label, value)
+            result_path = pred_path.parent / "results.json"
+            result = load_result(result_path)
+            predictions = load_predictions(pred_path)
+            if (predictions.experiment_id, predictions.source_lang, predictions.target_lang) != (
+                result.experiment_id, result.source_lang, result.target_lang
+            ):
+                raise ValueError("Prediction/result experiment or language mismatch")
+            if manifest is not None:
+                from afriscience_mt.core.alignment import aligned_inputs, manifest_fingerprint
+                sources, hypotheses, references = aligned_inputs(predictions, result, manifest)
+                alignment = {"mode": "sample_id", "reference_fingerprint": manifest_fingerprint(manifest)}
             else:
-                r.metrics.extra[label] = value
-            r.metadata.setdefault("rescored", []).append({
+                if predictions.reference_fingerprint is not None or any(
+                    isinstance(sample, dict) and "sample_id" in sample for sample in predictions.samples
+                ):
+                    raise ValueError("ID-bearing predictions require --reference-manifest")
+                sources, hypotheses, references = _rescore_inputs(predictions, result)
+                alignment = {"mode": "legacy_positional_unverified"}
+            if args.skip_existing and _metric_present(result, label):
+                n_skip += 1
+                continue
+            prepared.append((result_path, result, sources, hypotheses, references, alignment))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            print(f"Invalid artifact {pred_path}: {exc}", file=sys.stderr)
+            return 1
+
+    if not prepared:
+        print(f"rescored 0, skipped {n_skip}")
+        return 0
+
+    from afriscience_mt.evaluation.metrics import compute_bleu, compute_chrf, MetricsCalculator
+    calc = MetricsCalculator(metrics=["ssa_comet"]) if args.metric == "ssa_comet" else None
+    n_done = 0
+    for result_path, result, sources, hypotheses, references, alignment in prepared:
+        try:
+            if args.metric == "bleu":
+                value = compute_bleu(hypotheses, references)["bleu"]
+            elif args.metric == "chrf":
+                value = compute_chrf(hypotheses, references)["chrf"]
+            else:
+                value = calc.compute(sources, hypotheses, references)["ssa_comet"]
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"Invalid metric value: {value!r}")
+            if label in {"bleu", "chrf", "ssa_comet"}:
+                setattr(result.metrics, label, value)
+            else:
+                result.metrics.extra[label] = value
+            result.metrics.num_samples = len(hypotheses)
+            result.metadata.setdefault("rescored", []).append({
                 "metric": label, "value": value,
                 "timestamp": datetime.utcnow().isoformat(),
+                "alignment": alignment,
             })
-            save_result(r, result_path)
+            save_result(result, result_path)
+        except Exception as exc:
+            print(f"Rescore failed for {result_path}: {exc}", file=sys.stderr)
+            return 1
         n_done += 1
-        print(f"  [{idx}/{total}] {pred_path.parent}: {args.metric}={value:.4f}")
-
-    print(f"\nrescored {n_done}, skipped {n_skip}")
+        print(f"{result_path.parent}: {args.metric}={value:.4f}")
+    print(f"rescored {n_done}, skipped {n_skip}")
     return 0
+
+
+def _rescore_inputs(predictions, result):
+    """Resolve legacy positional inputs only against an exact-length DCS test set.
+
+    Equal lengths cannot establish order/provenance for hypothesis-only files.
+    This path is explicitly recorded as unverified positional alignment.
+    """
+    from afriscience_mt.core.validation import validate_parallel_inputs
+
+    samples = predictions.samples
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("samples must be a nonempty list")
+    if any(not isinstance(sample, dict) for sample in samples):
+        raise ValueError("Each sample must be an object")
+    needs_src = any("src" not in sample for sample in samples)
+    needs_ref = any("ref" not in sample for sample in samples)
+    ext_src = ext_ref = ()
+    if needs_src or needs_ref:
+        if result.dataset != "dcs" or result.split != "test":
+            raise ValueError("Legacy positional fallback requires dataset=dcs and split=test")
+        if needs_src:
+            ext_src = _test_text_column(predictions.source_lang)
+            if len(ext_src) != len(samples):
+                raise ValueError("Source test split length does not match predictions")
+        if needs_ref:
+            ext_ref = _test_text_column(predictions.target_lang)
+            if len(ext_ref) != len(samples):
+                raise ValueError("Reference test split length does not match predictions")
+    sources = [s["src"] if "src" in s else ext_src[i] for i, s in enumerate(samples)]
+    references = [s["ref"] if "ref" in s else ext_ref[i] for i, s in enumerate(samples)]
+    hypotheses = [s["hyp"] for s in samples]
+    validate_parallel_inputs(sources=sources, hypotheses=hypotheses, references=references)
+    if any(not ref.strip() for ref in references):
+        raise ValueError("Reference text must not be empty")
+    return sources, hypotheses, references
 
 
 def _eval_zero_shot(argv: list[str]) -> int:
